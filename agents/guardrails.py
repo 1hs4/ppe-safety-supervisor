@@ -1,0 +1,380 @@
+"""
+Guardrails: constraints on OUTCOMES, not on process.
+
+This is what lets the agents be genuinely autonomous. They may call whatever tools they
+judge useful, in whatever order, and loop as long as they need -- because nothing they do
+can produce a finding that fails these checks. The agent is free; the output is not.
+
+Forcing a fixed sequence of tool calls would be the alternative, and it buys less than it
+looks: an agent made to call `lookup_clause` can still write a notice that ignores what
+came back. Checking the finished draft is both stricter and less constraining.
+
+Each check returns a Verdict rather than raising, so the graph can route a blocked case
+to a human instead of losing it.
+"""
+
+from __future__ import annotations
+
+import re
+
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+ROOT = Path(__file__).absolute().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from agents.state import BAND_ACTION, Action, Blocker, CaseState  # noqa: E402
+
+
+@dataclass(frozen=True)
+class Verdict:
+    passed: bool
+    reason: str = ""
+    blocker: Blocker | None = None
+
+    def __bool__(self) -> bool:
+        return self.passed
+
+
+OK = Verdict(True)
+
+
+# ---------------------------------------------------------------------------
+# Entry gate
+# ---------------------------------------------------------------------------
+
+SUPPORTED_SCHEMA_MAJOR = "1"
+
+# Every nested path the agents and gates actually read. Checked for PRESENCE, not for a
+# truthy value -- an empty `ppe.present` is a normal event, a missing one is a different
+# schema wearing the same version number.
+REQUIRED_PATHS = (
+    ("event_id",), ("captured_at",), ("camera_id",), ("status",),
+    ("zone", "name"), ("zone", "required_ppe"),
+    ("ppe", "present"), ("ppe", "missing"), ("ppe", "indeterminate"),
+    ("confirmation", "confirmed"), ("confirmation", "frames_observed"),
+    ("confirmation", "frames_missing"),
+    ("subject", "detection_confidence"),
+    ("detector", "recall"),
+)
+
+_ABSENT = object()
+
+
+def _dig(event: dict, path: tuple):
+    node = event
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return _ABSENT
+        node = node[key]
+    return node
+
+
+def gate_event_is_well_formed(state: CaseState) -> Verdict:
+    """Check the fields exist, not just that the version number looks right.
+
+    `gate_schema_understood` only catches drift somebody declared. The likelier accident
+    is a field renamed or re-nested with the version left alone -- and that failure is
+    invisible, because every reader below uses .get() with a default. A renamed
+    `confirmation.confirmed` does not raise; it makes every finding look unconfirmed,
+    sends the lot to the review queue, and leaves the pipeline looking healthy while it
+    escalates nothing.
+
+    Presence, not truth: `ppe.present` being empty is an ordinary event. `ppe.present`
+    being absent means this is not the schema these agents read.
+    """
+    missing = [".".join(p) for p in REQUIRED_PATHS if _dig(state.event, p) is _ABSENT]
+    if missing:
+        return Verdict(False,
+                       "the event is missing fields the agents read: "
+                       + ", ".join(missing),
+                       Blocker.SCHEMA_UNSUPPORTED)
+    return OK
+
+
+def gate_schema_understood(state: CaseState) -> Verdict:
+    """Refuse an event whose shape these agents were not written against.
+
+    This one exists because the failure it prevents is silent. Every gate below reads
+    the event with .get() and a default, so a renamed or moved field does not raise --
+    it makes the finding look unconfirmed, routes it to review, and the system goes on
+    appearing to work while processing nothing. A pipeline that quietly stops
+    escalating is worse than one that stops.
+
+    Lane A owns the schema and will bump it (dropping severity_multiplier is a bump
+    already on the list). A minor bump is additive and safe; a major one means fields
+    this code reads may have moved, and guessing is not available to us.
+    """
+    version = str(state.event.get("schema_version") or "").strip()
+    if not version:
+        return Verdict(False, "the event carries no schema_version",
+                       Blocker.SCHEMA_UNSUPPORTED)
+    if version.split(".")[0] != SUPPORTED_SCHEMA_MAJOR:
+        return Verdict(False,
+                       f"event schema {version} is not understood by agents written "
+                       f"for {SUPPORTED_SCHEMA_MAJOR}.x",
+                       Blocker.SCHEMA_UNSUPPORTED)
+    return OK
+
+
+def gate_actionable(state: CaseState) -> Verdict:
+    """Only a temporally confirmed violation may enter the agent layer.
+
+    `status == "violation"` alone is not enough: it ignores whether the finding was
+    sustained across frames, and at helmet recall 0.796 a single frame mislabels a
+    compliant worker about one time in five.
+    """
+    event = state.event
+    if event.get("status") != "violation":
+        return Verdict(False, f"status is {event.get('status')!r}, not a violation")
+    if not event.get("confirmation", {}).get("confirmed", False):
+        return Verdict(False, "not confirmed across frames -- a single frame cannot accuse")
+    return OK
+
+
+def gate_no_indeterminate_accusation(state: CaseState) -> Verdict:
+    """'I could not look' must never become an accusation.
+
+    An item the vision system could not assess may not appear in a finding at all.
+    """
+    ppe = state.event.get("ppe", {})
+    overlap = set(ppe.get("missing", [])) & set(ppe.get("indeterminate", []))
+    if overlap:
+        return Verdict(False, f"{sorted(overlap)} is both missing and unassessable")
+    return OK
+
+
+# ---------------------------------------------------------------------------
+# After the Assessor
+# ---------------------------------------------------------------------------
+
+def gate_citation_present(state: CaseState) -> Verdict:
+    """No citation, no decision. Slide 9's guarantee.
+
+    The agent chose freely how to get here; it does not get to arrive without one.
+    """
+    if state.draft is None:
+        return Verdict(False, "no draft", Blocker.NO_CITATION)
+    if not state.draft.has_citation:
+        return Verdict(False, "the draft cites no regulation", Blocker.NO_CITATION)
+    return OK
+
+
+def gate_citations_are_construction(state: CaseState) -> Verdict:
+    """1910 is general industry. On a construction site it is the right topic from the
+    wrong body of law, and a real-looking wrong citation is worse than none."""
+    for c in state.draft.citations if state.draft else []:
+        if not c.clause_id.startswith("1926."):
+            return Verdict(False, f"{c.clause_id} is not part 1926", Blocker.NO_CITATION)
+    return OK
+
+
+def gate_site_policy_is_labelled(state: CaseState) -> Verdict:
+    """A notice must never present site policy as a regulatory requirement.
+
+    Construction has no hand-protection clause and no general hi-vis clause, so gloves
+    and vests rest on the employer's general duty. Saying "required under 1926.95" would
+    overstate it.
+    """
+    if state.draft is None:
+        return Verdict(False, "no draft")
+    body = (state.draft.summary or "").lower()
+    for c in state.draft.citations:
+        if c.is_site_policy and body and "site policy" not in body:
+            return Verdict(
+                False,
+                f"{c.clause_id} is cited as site policy but the summary does not say so")
+    return OK
+
+
+# ---------------------------------------------------------------------------
+# After the Adjudicator
+# ---------------------------------------------------------------------------
+
+HUMAN_REQUIRED = {Action.ESCALATION, Action.STOP_WORK}
+
+
+def gate_human_approval(state: CaseState) -> Verdict:
+    """Escalation and stop-work pause for a person. Always.
+
+    The system drafts; a supervisor sends. Nothing leaves the building on a model's say-so.
+    """
+    d = state.decision
+    if d is None:
+        return Verdict(False, "no decision")
+    if d.action in HUMAN_REQUIRED and not d.requires_approval:
+        return Verdict(False, f"{d.action.value} must require approval",
+                       Blocker.HUMAN_APPROVAL)
+    return OK
+
+
+def gate_low_confidence_goes_to_a_human(state: CaseState, confidence) -> Verdict:
+    """High severity with weak evidence is urgent REVIEW, not a quiet downgrade.
+
+    Severity says how bad this is if true; confidence says how sure we are. They are
+    separate axes, and the wrong response to 'serious but uncertain' is to act on it.
+    """
+    d = state.decision
+    if d is None:
+        return Verdict(False, "no decision")
+    if confidence.is_low and d.action in HUMAN_REQUIRED:
+        return Verdict(False,
+                       f"confidence {confidence.score} is low for a {d.action.value}",
+                       Blocker.HUMAN_APPROVAL)
+    return OK
+
+
+# Phrases that assert a pattern rather than describe one incident.
+#
+# The first version listed a dozen words and was beaten by five of six ordinary
+# paraphrases -- "has done this before", "not the first time", "habitually ignores",
+# "persistent non-compliance", "was also caught last week". It also fired on things a
+# single-incident notice says all the time: "do not let this happen again", "please
+# continue to monitor". Each pattern below is written against both lists -- the ways a
+# model alleges a history, and the look-alikes that do not: "priority" is not "prior",
+# "before resuming work" is not "before", and "multiple violations" in one finding is
+# several missing items, not a record.
+#
+# It is still a word list. It narrows the gap; it does not close it, which is why the
+# notice now also carries a "Record:" line the model did not write (see graph.py).
+_OCCASION = (r"(offen[cs]es?|violations?|times?|occasions?|incidents?|instances?|"
+             r"breach(es)?|infractions?|warnings?)")
+_RECORD = (r"(violations?|offen[cs]es?|incidents?|warnings?|citations?|breach(es)?|"
+           r"infractions?|findings?)")
+_DEFY = (r"(ignor|disregard|refus|fail|neglect|violat|flout|remov|forget|skip|offend|"
+         r"work\w* without|operat\w* without)\w*")
+
+PATTERN_CLAIMS = (
+    # a record, stated outright -- unless it is being denied ("no prior violations")
+    rf"(?<!\bno )(?<!\bany )\b(prior|previous|earlier|past|last) {_RECORD}\b",
+    r"\b(was|were|been|has|have|had) previously\b",
+    r"\bpreviously (been )?(warned|cited|reminded|told|disciplined|caught|seen|found|"
+    r"observed|reported|flagged)\b",
+    r"\balready (been )?(warned|cited|reminded|told|disciplined|caught)\b",
+    r"\bha(s|ve|d) been (warned|cited|reminded|disciplined|caught)\b",
+    r"\balso (been )?(caught|cited|warned|disciplined|reported for)\b",
+    r"\b(history|pattern) of\b", r"\btrack record\b", r"\bhas a record\b",
+    r"\b(disciplinary|poor|bad) record\b", r"\bknown for\b",
+    # not the first time
+    r"\bnot (the|his|her|their|a) first\b", r"\bnot (an? )?isolated\b",
+    rf"\b(second|third|fourth|fifth|sixth|\d+(st|nd|rd|th)) {_OCCASION}\b",
+    r"\byet another\b",
+    r"\b(on|in) (several|multiple|numerous|many|a number of|repeated|other|previous) "
+    r"(occasions|times|shifts|days|visits|inspections)\b",
+    r"\b(several|numerous|many|multiple) (times|occasions|incidents)\b",
+    # a time before this one
+    r"\b(last|previous|prior|earlier) (week|month|shift|day|time|occasion|visit|"
+    r"inspection|audit)\b",
+    r"\bearlier (today|this (week|month|shift))\b", r"\bin the past\b",
+    r"\b(done|happened|occurred|seen|caught|found|observed|warned|cited|reminded|told|"
+    r"flagged|reported)\b[^.;:!?\n]{0,40}?\bbefore\s*(?=[.,;:!?)\n]|$)",
+    # habit
+    r"\b(habitual(ly)?|chronic(ally)?|recurr(ing|ent)|persistently|repeatedly)\b",
+    r"\bpersistent (non-?compliance|failures?|disregard|violations?|refusal|neglect)\b",
+    r"\bconsistently (fail|ignor|disregard|refus|neglect)\w*",
+    r"\brepeat(ed)? (offen\w*|violations?|failures?|non-?compliance|breach(es)?|"
+    r"infractions?|incidents?|behaviou?r|pattern|findings?)\b",
+    r"\bre-?offen\w*",
+    # again -- as an allegation, not as a request ("do not let this happen again")
+    r"\b(once|yet|time and( time)?) again\b", r"(^|[.!?;]\s*)again\b",
+    r"\b(was|were|is|are|been|being|caught|seen|found|observed|spotted|cited|warned)"
+    r"\b(\s+\w+){0,3}\s+again\b",
+    rf"\bcontinu(e|es|ed|ing) to {_DEFY}", rf"\bkeeps? (on )?{_DEFY}",
+)
+
+
+def gate_no_unsupported_pattern_claim(state: CaseState) -> Verdict:
+    """The notice may not allege a pattern the record does not show.
+
+    This is the one place the model can do real harm with prose alone. A supervisor
+    reading "this is the worker's third violation" will act on it, and if identity was
+    never bound there is no third violation -- there is one finding and an accusation
+    built on nothing.
+
+    The severity number cannot cause this, because `final_severity` reads the confirmed
+    count itself. The draft text can, because nothing else checks it.
+
+    It replaces an earlier `gate_escalation_needs_priors`, which compared
+    `prior_violations` against `history.resolved`. That could never fire: the
+    Adjudicator already zeroes the count when identity is unresolved, so the two could
+    not disagree. This checks the claim that actually reaches a human.
+    """
+    d = state.decision
+    if d is None:
+        return Verdict(False, "no decision")
+    if d.prior_violations > 0:
+        return OK                      # the record supports whatever it says
+
+    text = f"{d.draft_body} {d.rationale}".lower()
+    for phrase in PATTERN_CLAIMS:
+        found = re.search(phrase, text)
+        if found:
+            return Verdict(False,
+                           f'the notice alleges a pattern ("{found.group(0).strip(" .;!?")}") '
+                           f"but no prior violation is on record",
+                           Blocker.WORKER_IDENTITY)
+    return OK
+
+
+def gate_action_matches_the_score(state: CaseState, severity) -> Verdict:
+    """An action may be gentler than the score, never harsher, without a human.
+
+    The Adjudicator is allowed to argue a case down -- weak evidence, a zone that reads
+    worse on paper than in life. Arguing one UP is different: it is the model deciding
+    someone deserves more than the rubric says, and the rubric is the part that is
+    auditable.
+
+    This is the gate that catches a scoring input going astray. An agent that reads
+    "2 prior violations" and then scores the case as a first offence produces exactly
+    this shape -- a warning-band number under an escalation -- and the mismatch is
+    visible here even when the action itself happens to be right.
+    """
+    d = state.decision
+    if d is None:
+        return Verdict(False, "no decision")
+    expected = BAND_ACTION.get(getattr(severity, "band", ""), None)
+    if expected is None:
+        return OK
+    if d.action.rank > expected.rank:
+        return Verdict(False,
+                       f"{d.action.value} is harsher than the score supports "
+                       f"({severity.final} = {severity.band})",
+                       Blocker.HUMAN_APPROVAL)
+    return OK
+
+
+# ---------------------------------------------------------------------------
+# After the Recorder
+# ---------------------------------------------------------------------------
+
+def gate_write_verified(state: CaseState) -> Verdict:
+    """A case closes only on a read-back.
+
+    The Recorder writes the history the Adjudicator reads on the next event. An
+    unconfirmed write silently turns a third offence into a first, and nothing in the
+    output looks wrong.
+    """
+    if state.record is None:
+        return Verdict(False, "nothing was recorded", Blocker.WRITE_UNCONFIRMED)
+    if not state.record.verified:
+        return Verdict(False, "the write was not confirmed by read-back",
+                       Blocker.WRITE_UNCONFIRMED)
+    return OK
+
+
+# ---------------------------------------------------------------------------
+
+ENTRY_GATES = (gate_actionable, gate_no_indeterminate_accusation)
+POST_ASSESSOR = (gate_citation_present, gate_citations_are_construction,
+                 gate_site_policy_is_labelled)
+POST_RECORDER = (gate_write_verified,)
+
+
+def run_gates(state: CaseState, gates) -> Verdict:
+    """First failure wins, so the reason a case was blocked is the first real problem."""
+    for gate in gates:
+        verdict = gate(state)
+        if not verdict:
+            return verdict
+    return OK

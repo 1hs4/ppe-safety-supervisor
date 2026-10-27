@@ -1,0 +1,37 @@
+# ---- perception (lane A) ----
+ultralytics>=8.4.148
+lap>=0.5.12          # ByteTrack association; ultralytics auto-installs it otherwise
+opencv-python>=4.10
+pillow>=10.0
+pyyaml>=6.0
+
+# ---- knowledge base + RAG (lane B) ----
+faiss-cpu>=1.8
+sentence-transformers>=3.0
+pyyaml>=6.0
+python-dotenv>=1.0
+# LLM-judged retrieval metrics. kb/eval_ragas.py has been run against these; the
+# deterministic Recall@k in kb/eval_retrieval.py needs neither.
+ragas>=0.4
+datasets>=3.0
+langchain>=0.3
+langchain-community>=0.3
+
+# ---- agents (lane C) ----
+langgraph>=0.2
+langchain-openai>=0.2
+python-dotenv>=1.0
+
+# ---- app + observability (lane D) ----
+fastapi>=0.115
+uvicorn[standard]>=0.30
+jinja2>=3.1          # the console pages (app/web/)
+# cloudinary -- dropped: evidence is stored locally (see perception/evidence.py)
+evidently>=0.4
+
+# ---- dev ----
+pytest>=8.0
+httpx>=0.27         # fastapi TestClient in tests/test_api.py
+
+# evaluation tooling only
+openpyxl>=3.1         # eval/agent_cases.py labelling sheet

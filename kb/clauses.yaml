@@ -1,0 +1,247 @@
+# PPE item -> governing clause, 29 CFR 1926 (construction).
+#
+# THIS FILE DECIDES THE CITATION. Retrieval never does.
+#
+# The violation space is small and enumerable -- six PPE classes across a handful of
+# zones -- so the clause is looked up, not inferred. Letting cosine similarity choose
+# which regulation a worker allegedly breached produces a confident, real-looking, wrong
+# citation, which is worse than no citation and is exactly what the citation guardrail
+# exists to catch. FAISS retrieves the TEXT of the clause named here.
+#
+# It also serves as the ground truth for citation accuracy in the week-6 evaluation.
+#
+# Scope decision and reasoning: docs/REGULATION_SCOPE.md
+# Source text: kb/corpus/*.xml, pulled from the eCFR API
+
+meta:
+  part: "1926"
+  title: "Safety and Health Regulations for Construction"
+  scope_note: >
+    Construction, not general industry. An inspector at a construction site cites under
+    1926; a citation issued under 1910 here would be the right topic from the wrong body
+    of law. See docs/REGULATION_SCOPE.md.
+  source: "https://www.ecfr.gov/current/title-29/subtitle-B/chapter-XVII/part-1926"
+  retrieved: "2026-09-16"
+
+# ---------------------------------------------------------------------------
+# Clauses referenced by this system. `authority` distinguishes a clause that
+# squarely covers the item from one applied through a general duty. Retrieval
+# also uses it to rank a specific provision above a general one.
+# ---------------------------------------------------------------------------
+clauses:
+  "1926.100":
+    title: "Head protection"
+    subpart: E
+    authority: specific
+    summary: >
+      Employees working in areas where there is a possible danger of head injury from
+      impact, falling or flying objects, or electrical shock and burns shall be protected
+      by protective helmets.
+
+  "1926.102":
+    title: "Eye and face protection"
+    subpart: E
+    authority: specific
+    summary: >
+      Employees shall be provided with eye and face protection equipment when machines or
+      operations present potential eye or face injury from physical, chemical or radiation
+      agents.
+
+  "1926.96":
+    title: "Occupational foot protection"
+    subpart: E
+    authority: narrow
+    summary: >
+      Safety-toe footwear for employees shall meet the requirements and specifications in
+      ANSI Z41.1-1967. This is a SPECIFICATION clause only -- it states what footwear must
+      meet, not when it must be worn. Construction has no equivalent of general industry's
+      1910.136, so the duty to wear comes from 1926.95(a) and 1926.28(a).
+
+  "1926.95":
+    title: "Criteria for personal protective equipment"
+    subpart: E
+    authority: general
+    summary: >
+      Protective equipment for eyes, face, head and extremities shall be provided, used
+      and maintained wherever hazards of processes or environment make it necessary.
+      Construction has no hand-protection section equivalent to general industry's
+      1910.138, so glove requirements are applied through this general criterion.
+
+  "1926.28":
+    title: "Personal protective equipment"
+    subpart: C
+    authority: general
+    summary: >
+      The employer is responsible for requiring the wearing of appropriate personal
+      protective equipment in all operations where there is an exposure to hazardous
+      conditions.
+
+  "1926.201":
+    title: "Signaling"
+    subpart: G
+    authority: narrow
+    summary: >
+      Signaling by flaggers, including warning garments worn by flaggers, shall conform to
+      Part 6 of the MUTCD, incorporated by reference. The garment requirement is therefore
+      in the MUTCD, not stated in this clause directly. Applies to flaggers directing
+      traffic, NOT to high-visibility clothing generally.
+
+# ---------------------------------------------------------------------------
+# PPE class -> clause. `basis` is what the notice must say it is relying on.
+#
+#   regulation    the clause squarely requires this item
+#   site_policy   no clause squarely covers it; the site requires it, supported by
+#                 the employer's general duty to assess hazards and provide PPE
+#
+# A notice must never present site policy as a regulatory requirement.
+# ---------------------------------------------------------------------------
+items:
+  helmet:
+    clause: "1926.100"
+    basis: regulation
+    notice_phrase: "head protection required under 29 CFR 1926.100"
+
+  goggles:
+    clause: "1926.102"
+    basis: regulation
+    notice_phrase: "eye and face protection required under 29 CFR 1926.102"
+
+  boots:
+    clause: "1926.95"
+    basis: site_policy
+    supporting_clause: "1926.28"
+    specification_clause: "1926.96"
+    notice_phrase: >
+      protective footwear required by site policy, supported by the employer's duty under
+      29 CFR 1926.95 and 1926.28 to provide PPE where hazards make it necessary; where
+      safety-toe footwear is used it must meet the specification in 29 CFR 1926.96
+    note: >
+      CORRECTED 16 Sep 2026. 1926.96 is a specification clause only -- it says what
+      safety-toe footwear must MEET, not when it must be WORN. The earlier version of
+      this entry quoted 1910.136, which is general industry and does not apply to
+      construction. Found by the Ragas evaluation: the model kept answering "the
+      regulation text does not contain the answer", and it was right.
+
+  gloves:
+    clause: "1926.95"
+    basis: site_policy
+    supporting_clause: "1926.28"
+    notice_phrase: >
+      hand protection required by site policy, supported by the employer's duty under
+      29 CFR 1926.95 and 1926.28 to provide PPE where hazards make it necessary
+    note: >
+      Construction has no dedicated hand-protection section. Do not cite 1910.138 -- that
+      is general industry and does not apply here.
+
+  vest:
+    clause: "1926.95"
+    basis: site_policy
+    supporting_clause: "1926.28"
+    notice_phrase: >
+      high-visibility clothing required by site policy, supported by the employer's duty
+      under 29 CFR 1926.95 and 1926.28 to provide PPE where hazards make it necessary
+    note: >
+      1926.201 covers flaggers only and must not be cited for general site hi-vis. If the
+      subject is flagging traffic, cite 1926.201 instead.
+
+# ---------------------------------------------------------------------------
+# Zone overrides. A zone may raise an item from site policy to a specific clause
+# when the hazard named in that clause is actually present there.
+# ---------------------------------------------------------------------------
+zone_overrides:
+  grinding_station:
+    goggles:
+      clause: "1926.102"
+      basis: regulation
+      reason: "abrasive wheel produces flying particles -- the hazard 1926.102 names"
+    gloves:
+      clause: "1926.95"
+      basis: site_policy
+      reason: "rotating abrasive wheel; hand protection is a site control"
+
+  welding_bay:
+    goggles:
+      clause: "1926.102"
+      basis: regulation
+      reason: "hot work produces radiation and flying particles"
+
+  loading_dock:
+    boots:
+      clause: "1926.95"
+      basis: site_policy
+      reason: >
+        falling and rolling objects during materials handling. Still site policy: 1926.96
+        specifies what safety-toe footwear must meet, but construction has no clause
+        requiring it to be worn, so the duty rests on 1926.95(a) and 1926.28(a).
+    vest:
+      clause: "1926.201"
+      basis: regulation
+      reason: "vehicle movement with personnel directing -- flagger provision applies"
+
+# ---------------------------------------------------------------------------
+# Item weights per zone, for the severity score.
+#
+# These are a POLICY INPUT set by the site safety officer, not something the system
+# derived. Severity sums the weights of MISSING items; zone totals are irrelevant.
+# See docs/SEVERITY_AND_IDENTITY.md.
+#
+# KEYED BY "camera/zone", NOT BY ZONE NAME. Zone names are only unique within a
+# camera -- two sites can each have a "walkway" with different requirements -- so a
+# bare name would silently share one weight table between them.
+#
+# Each entry must list EXACTLY the items its zone requires in zones.json. An item
+# required but not weighted scores zero: the violation is reported and then never
+# escalates, with nothing in the output looking wrong. ClauseMap.score() raises
+# rather than allow that, and tests/test_clause_map.py asserts the two files agree.
+#
+# Values are hazard-scaled: eye protection is worth more at an abrasive wheel than on
+# a walkway, because that is where the hazard 1926.102 names actually exists.
+# ---------------------------------------------------------------------------
+severity_weights:
+  default:
+    helmet: 5
+    goggles: 3
+    gloves: 3
+    boots: 3
+    vest: 2
+
+  # --- cam_3 (EXAMPLE camera, underpins the fixtures) ---
+  cam_3/walkway:
+    helmet: 5
+  cam_3/grinding_station:
+    helmet: 5
+    goggles: 4
+    gloves: 4
+  cam_3/welding_bay:
+    helmet: 5
+    goggles: 4
+    gloves: 4
+    vest: 3
+  cam_3/loading_dock:
+    helmet: 5
+    vest: 3
+    boots: 4
+
+  # --- cam_1 (EXAMPLE camera) ---
+  cam_1/assembly_line:
+    helmet: 5
+    gloves: 3
+
+  # --- d_view02 (the real CCTV segment) ---
+  d_view02/walkway:
+    helmet: 5
+    vest: 2
+  d_view02/work_area:
+    helmet: 5
+    vest: 2
+    gloves: 3
+
+bands:
+  compliant: [0, 0]
+  log_only: [1, 2]
+  warning: [3, 4]
+  escalation: [5, 7]
+  stop_work: [8, 999]
+
+repeat_penalty_per_prior: 2
+repeat_window_days: 7
