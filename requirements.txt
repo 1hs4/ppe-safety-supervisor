@@ -1,0 +1,28 @@
+# ---- perception (lane A) ----
+ultralytics>=8.4.148
+lap>=0.5.12          # ByteTrack association; ultralytics auto-installs it otherwise
+opencv-python>=4.10
+pillow>=10.0
+pyyaml>=6.0
+
+# ---- knowledge base + RAG (lane B) ----
+langchain>=0.3
+langchain-community>=0.3
+faiss-cpu>=1.8
+sentence-transformers>=3.0
+ragas>=0.2
+
+# ---- agents (lane C) ----
+langgraph>=0.2
+langchain-openai>=0.2
+python-dotenv>=1.0
+
+# ---- app + observability (lane D) ----
+fastapi>=0.115
+uvicorn[standard]>=0.30
+streamlit>=1.38
+# cloudinary -- dropped: evidence is stored locally (see evidence.py)
+evidently>=0.4
+
+# ---- dev ----
+pytest>=8.0
